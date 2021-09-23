@@ -3,9 +3,7 @@
 # Initial version was taken from https://github.com/rwightman/pytorch-image-models
 # which was cleaned up and adapted for MMF.
 
-import collections.abc
-import math
-import warnings
+
 from dataclasses import dataclass
 from functools import partial
 from itertools import repeat
@@ -17,362 +15,25 @@ import torch.nn.functional as F
 from mmf.common.registry import registry
 from mmf.modules.encoders import Encoder
 
+from timm.models.vision_transformer import PatchEmbed
+from timm.models.layers import trunc_normal_, DropPath
+
 
 @registry.register_encoder("albef_vit_encoder")
 class AlbefVitEncoder(Encoder):
     @dataclass
     class Config(Encoder.Config):
         name: str = "albef_vit_encoder"
-        pretrained: bool = False
+        img_size: int = 334
         out_dim: int = 768
 
     def __init__(self, config: Config, *args, **kwargs):
         super().__init__()
         self.config = config.get("params", {})
-        pretrained = config.get("pretrained", False)
-        pretrained_path = config.get("pretrained_path", None)
         self.vit = VisionTransformer(self.config)
-        if pretrained:
-            state_dict = torch.load(pretrained_path)
-            self.vit.load_state_dict(state_dict)
-            self.vit.eval()
 
     def forward(self, x: torch.Tensor):
         x = self.vit(x)
-        return x
-
-
-# From PyTorch internals
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, collections.abc.Iterable):
-            return x
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_1tuple = _ntuple(1)
-to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-to_ntuple = _ntuple
-
-
-""" DropBlock, DropPath
-PyTorch implementations of DropBlock and DropPath (Stochastic Depth) regularization layers.
-Papers:
-DropBlock: A regularization method for convolutional networks (https://arxiv.org/abs/1810.12890)
-Deep Networks with Stochastic Depth (https://arxiv.org/abs/1603.09382)
-Code:
-DropBlock impl inspired by two Tensorflow impl that I liked:
- - https://github.com/tensorflow/tpu/blob/master/models/official/resnet/resnet_model.py#L74
- - https://github.com/clovaai/assembled-cnn/blob/master/nets/blocks.py
-Hacked together by / Copyright 2020 Ross Wightman
-"""
-
-
-def drop_block_2d(
-    x,
-    drop_prob: float = 0.1,
-    block_size: int = 7,
-    gamma_scale: float = 1.0,
-    with_noise: bool = False,
-    inplace: bool = False,
-    batchwise: bool = False,
-):
-    """DropBlock. See https://arxiv.org/pdf/1810.12890.pdf
-    DropBlock with an experimental gaussian noise option. This layer has been tested on a few training
-    runs with success, but needs further validation and possibly optimization for lower runtime impact.
-    """
-    B, C, H, W = x.shape
-    total_size = W * H
-    clipped_block_size = min(block_size, min(W, H))
-    # seed_drop_rate, the gamma parameter
-    gamma = (
-        gamma_scale
-        * drop_prob
-        * total_size
-        / clipped_block_size ** 2
-        / ((W - block_size + 1) * (H - block_size + 1))
-    )
-
-    # Forces the block to be inside the feature map.
-    w_i, h_i = torch.meshgrid(
-        torch.arange(W).to(x.device), torch.arange(H).to(x.device)
-    )
-    valid_block = (
-        (w_i >= clipped_block_size // 2) & (w_i < W - (clipped_block_size - 1) // 2)
-    ) & ((h_i >= clipped_block_size // 2) & (h_i < H - (clipped_block_size - 1) // 2))
-    valid_block = torch.reshape(valid_block, (1, 1, H, W)).to(dtype=x.dtype)
-
-    if batchwise:
-        # one mask for whole batch, quite a bit faster
-        uniform_noise = torch.rand((1, C, H, W), dtype=x.dtype, device=x.device)
-    else:
-        uniform_noise = torch.rand_like(x)
-    block_mask = ((2 - gamma - valid_block + uniform_noise) >= 1).to(dtype=x.dtype)
-    block_mask = -F.max_pool2d(
-        -block_mask,
-        kernel_size=clipped_block_size,  # block_size,
-        stride=1,
-        padding=clipped_block_size // 2,
-    )
-
-    if with_noise:
-        normal_noise = (
-            torch.randn((1, C, H, W), dtype=x.dtype, device=x.device)
-            if batchwise
-            else torch.randn_like(x)
-        )
-        if inplace:
-            x.mul_(block_mask).add_(normal_noise * (1 - block_mask))
-        else:
-            x = x * block_mask + normal_noise * (1 - block_mask)
-    else:
-        normalize_scale = (
-            block_mask.numel() / block_mask.to(dtype=torch.float32).sum().add(1e-7)
-        ).to(x.dtype)
-        if inplace:
-            x.mul_(block_mask * normalize_scale)
-        else:
-            x = x * block_mask * normalize_scale
-    return x
-
-
-def drop_block_fast_2d(
-    x: torch.Tensor,
-    drop_prob: float = 0.1,
-    block_size: int = 7,
-    gamma_scale: float = 1.0,
-    with_noise: bool = False,
-    inplace: bool = False,
-    batchwise: bool = False,
-):
-    """DropBlock. See https://arxiv.org/pdf/1810.12890.pdf
-    DropBlock with an experimental gaussian noise option. Simplied from above without concern for valid
-    block mask at edges.
-    """
-    B, C, H, W = x.shape
-    total_size = W * H
-    clipped_block_size = min(block_size, min(W, H))
-    gamma = (
-        gamma_scale
-        * drop_prob
-        * total_size
-        / clipped_block_size ** 2
-        / ((W - block_size + 1) * (H - block_size + 1))
-    )
-
-    if batchwise:
-        # one mask for whole batch, quite a bit faster
-        block_mask = torch.rand((1, C, H, W), dtype=x.dtype, device=x.device) < gamma
-    else:
-        # mask per batch element
-        block_mask = torch.rand_like(x) < gamma
-    block_mask = F.max_pool2d(
-        block_mask.to(x.dtype),
-        kernel_size=clipped_block_size,
-        stride=1,
-        padding=clipped_block_size // 2,
-    )
-
-    if with_noise:
-        normal_noise = (
-            torch.randn((1, C, H, W), dtype=x.dtype, device=x.device)
-            if batchwise
-            else torch.randn_like(x)
-        )
-        if inplace:
-            x.mul_(1.0 - block_mask).add_(normal_noise * block_mask)
-        else:
-            x = x * (1.0 - block_mask) + normal_noise * block_mask
-    else:
-        block_mask = 1 - block_mask
-        normalize_scale = (
-            block_mask.numel() / block_mask.to(dtype=torch.float32).sum().add(1e-7)
-        ).to(dtype=x.dtype)
-        if inplace:
-            x.mul_(block_mask * normalize_scale)
-        else:
-            x = x * block_mask * normalize_scale
-    return x
-
-
-class DropBlock2d(nn.Module):
-    """DropBlock. See https://arxiv.org/pdf/1810.12890.pdf"""
-
-    def __init__(
-        self,
-        drop_prob=0.1,
-        block_size=7,
-        gamma_scale=1.0,
-        with_noise=False,
-        inplace=False,
-        batchwise=False,
-        fast=True,
-    ):
-        super().__init__()
-        self.drop_prob = drop_prob
-        self.gamma_scale = gamma_scale
-        self.block_size = block_size
-        self.with_noise = with_noise
-        self.inplace = inplace
-        self.batchwise = batchwise
-        self.fast = fast  # FIXME finish comparisons of fast vs not
-
-    def forward(self, x):
-        if not self.training or not self.drop_prob:
-            return x
-        if self.fast:
-            return drop_block_fast_2d(
-                x,
-                self.drop_prob,
-                self.block_size,
-                self.gamma_scale,
-                self.with_noise,
-                self.inplace,
-                self.batchwise,
-            )
-        else:
-            return drop_block_2d(
-                x,
-                self.drop_prob,
-                self.block_size,
-                self.gamma_scale,
-                self.with_noise,
-                self.inplace,
-                self.batchwise,
-            )
-
-
-def drop_path(x, drop_prob: float = 0.0, training: bool = False):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
-    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
-    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
-    'survival rate' as the argument.
-    """
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (
-        x.ndim - 1
-    )  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()  # binarize
-    output = x.div(keep_prob) * random_tensor
-    return output
-
-
-class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
-
-    def __init__(self, drop_prob=None):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training)
-
-
-def _no_grad_trunc_normal_(tensor, mean, std, a, b):
-    # Cut & paste from PyTorch official master until it's in a few official releases - RW
-    # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    def norm_cdf(x):
-        # Computes standard normal cumulative distribution function
-        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
-    if (mean < a - 2 * std) or (mean > b + 2 * std):
-        warnings.warn(
-            "mean is more than 2 std from [a, b] in nn.init.trunc_normal_. "
-            "The distribution of values may be incorrect.",
-            stacklevel=2,
-        )
-
-    with torch.no_grad():
-        # Values are generated by using a truncated uniform distribution and
-        # then using the inverse CDF for the normal distribution.
-        # Get upper and lower cdf values
-        l = norm_cdf((a - mean) / std)
-        u = norm_cdf((b - mean) / std)
-
-        # Uniformly fill tensor with values from [l, u], then translate to
-        # [2l-1, 2u-1].
-        tensor.uniform_(2 * l - 1, 2 * u - 1)
-
-        # Use inverse cdf transform for normal distribution to get truncated
-        # standard normal
-        tensor.erfinv_()
-
-        # Transform to proper mean, std
-        tensor.mul_(std * math.sqrt(2.0))
-        tensor.add_(mean)
-
-        # Clamp to ensure it's in the proper range
-        tensor.clamp_(min=a, max=b)
-        return tensor
-
-
-def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
-    r"""
-    # type: (Tensor, float, float, float, float) -> Tensor
-
-    Fills the input Tensor with values drawn from a truncated
-    normal distribution. The values are effectively drawn from the
-    normal distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`
-    with values outside :math:`[a, b]` redrawn until they are within
-    the bounds. The method used for generating the random values works
-    best when :math:`a \leq \text{mean} \leq b`.
-    Args:
-        tensor: an n-dimensional `torch.Tensor`
-        mean: the mean of the normal distribution
-        std: the standard deviation of the normal distribution
-        a: the minimum cutoff value
-        b: the maximum cutoff value
-    Examples:
-        >>> w = torch.empty(3, 5)
-        >>> nn.init.trunc_normal_(w)
-    """
-    return _no_grad_trunc_normal_(tensor, mean, std, a, b)
-
-
-class PatchEmbed(nn.Module):
-    """2D Image to Patch Embedding"""
-
-    def __init__(
-        self,
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        embed_dim=768,
-        norm_layer=None,
-        flatten=True,
-    ):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.flatten = flatten
-
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x)
-        if self.flatten:
-            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
-        x = self.norm(x)
         return x
 
 
@@ -538,7 +199,7 @@ class VisionTransformer(nn.Module):
         self.patch_size = config.get("patch_size", 16)
         self.in_chans = config.get("in_chans", 3)
         self.num_classes = config.get("num_classes", 1000)
-        self.embed_dim = config.get("embed_dim", 768)
+        self.embed_dim = config.get("out_dim", 768)
         self.depth = config.get("depth", 12)
         self.num_heads = config.get("num_heads", 12)
         self.mlp_ratio = config.get("mlp_ratio", 4.0)
